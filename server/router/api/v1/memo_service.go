@@ -701,6 +701,15 @@ func (s *APIV1Service) CreateMemoComment(ctx context.Context, request *v1pb.Crea
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create memo relation")
 	}
+	// memoComment was built by CreateMemo before the COMMENT relation existed, so
+	// its Relations field is empty. Reload relations from the store so the returned
+	// memo and the memo.comment.created webhook payload both carry the COMMENT relation
+	// pointing back at the parent memo.
+	relations, err := s.loadMemoRelations(ctx, memo)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to load memo relations")
+	}
+	memoComment.Relations = relations
 	creator, err := ResolveUserByName(ctx, s.Store, memoComment.Creator)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid memo creator")

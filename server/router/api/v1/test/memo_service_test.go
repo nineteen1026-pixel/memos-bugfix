@@ -2,8 +2,13 @@ package test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +18,9 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/usememos/memos/internal/webhook"
 	apiv1 "github.com/usememos/memos/proto/gen/api/v1"
+	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
 
@@ -729,4 +736,115 @@ func TestCreateMemoWithCustomTimestamps(t *testing.T) {
 	require.NotNil(t, memoWithoutTimestamps.CreateTime, "create_time should be auto-generated")
 	require.NotNil(t, memoWithoutTimestamps.UpdateTime, "update_time should be auto-generated")
 	require.True(t, time.Now().Unix()-memoWithoutTimestamps.CreateTime.AsTime().Unix() < 5, "create_time should be recent (within 5 seconds)")
+}
+
+// TestCreateMemoCommentReturnsCommentRelation verifies that the Memo returned by
+// CreateMemoComment — and the memo.comment.created webhook payload derived from it —
+// both carry the COMMENT relation linking the comment memo back to its parent memo.
+// Previously the relation was created after CreateMemo had already built the response
+// memo, so the returned memo (and thus the webhook payload) reported an empty
+// Relations field, leaving webhook receivers unable to tell which memo was commented on.
+func TestCreateMemoCommentReturnsCommentRelation(t *testing.T) {
+	ctx := context.Background()
+
+	ts := NewTestService(t)
+	defer ts.Cleanup()
+
+	owner, err := ts.CreateRegularUser(ctx, "comment-relation-owner")
+	require.NoError(t, err)
+	ownerCtx := ts.CreateUserContext(ctx, owner.ID)
+
+	parent, err := ts.Service.CreateMemo(ownerCtx, &apiv1.CreateMemoRequest{
+		Memo: &apiv1.Memo{
+			Content:    "parent memo for comment relation",
+			Visibility: apiv1.Visibility_PRIVATE,
+		},
+	})
+	require.NoError(t, err)
+
+	// Register a webhook owned by the parent memo's creator. The webhook is dispatched
+	// to the related memo owner, so it must belong to `owner`.
+	var receivedMu sync.Mutex
+	var receivedBody []byte
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		receivedMu.Lock()
+		receivedBody = body
+		receivedMu.Unlock()
+		_, _ = w.Write([]byte(`{"code":0}`))
+		select {
+		case received <- struct{}{}:
+		default:
+		}
+	}))
+	defer server.Close()
+
+	// httptest listens on 127.0.0.1, which the SSRF guard blocks by default.
+	prevAllowPrivateIPs := webhook.AllowPrivateIPs
+	webhook.AllowPrivateIPs = true
+	defer func() { webhook.AllowPrivateIPs = prevAllowPrivateIPs }()
+
+	err = ts.Store.AddUserWebhook(ctx, owner.ID, &storepb.WebhooksUserSetting_Webhook{
+		Id:    "comment-relation-hook",
+		Title: "comment relation hook",
+		Url:   server.URL,
+	})
+	require.NoError(t, err)
+
+	comment, err := ts.Service.CreateMemoComment(ownerCtx, &apiv1.CreateMemoCommentRequest{
+		Name: parent.Name,
+		Comment: &apiv1.Memo{
+			Content: "a comment that should carry its COMMENT relation",
+		},
+	})
+	require.NoError(t, err)
+
+	// The returned memo must already include the COMMENT relation pointing at the parent.
+	requireCommentRelation(t, comment.Relations, comment.Name, parent.Name)
+
+	// Re-fetching via GetMemo is the behavior that already worked; assert it still does.
+	fetched, err := ts.Service.GetMemo(ownerCtx, &apiv1.GetMemoRequest{Name: comment.Name})
+	require.NoError(t, err)
+	requireCommentRelation(t, fetched.Relations, comment.Name, parent.Name)
+
+	// The async webhook payload must embed the same COMMENT relation.
+	select {
+	case <-received:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for memo.comment.created webhook")
+	}
+
+	receivedMu.Lock()
+	body := receivedBody
+	receivedMu.Unlock()
+
+	var payload struct {
+		ActivityType string      `json:"activityType"`
+		Memo         *apiv1.Memo `json:"memo"`
+	}
+	require.NoError(t, json.Unmarshal(body, &payload))
+	require.Equal(t, "memos.memo.comment.created", payload.ActivityType)
+	require.NotNil(t, payload.Memo)
+	requireCommentRelation(t, payload.Memo.Relations, comment.Name, parent.Name)
+}
+
+// requireCommentRelation asserts that relations contains exactly one COMMENT relation
+// whose memo is the comment and whose related memo is the parent.
+func requireCommentRelation(t *testing.T, relations []*apiv1.MemoRelation, commentName, parentName string) {
+	t.Helper()
+	var found *apiv1.MemoRelation
+	for _, r := range relations {
+		if r.Type == apiv1.MemoRelation_COMMENT {
+			if found != nil {
+				t.Fatalf("expected exactly one COMMENT relation, found multiple")
+			}
+			found = r
+		}
+	}
+	require.NotNil(t, found, "expected a COMMENT relation, got %d relations", len(relations))
+	require.NotNil(t, found.Memo, "COMMENT relation must reference the comment memo")
+	require.NotNil(t, found.RelatedMemo, "COMMENT relation must reference the parent memo")
+	require.Equal(t, commentName, found.Memo.Name, "COMMENT relation memo must be the comment memo")
+	require.Equal(t, parentName, found.RelatedMemo.Name, "COMMENT related memo must be the parent memo")
 }
